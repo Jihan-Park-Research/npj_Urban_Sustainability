@@ -1,0 +1,499 @@
+# 01. Settings 
+import os
+import re
+import json
+from pathlib import Path
+import requests
+from openai import OpenAI
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from sentence_transformers import CrossEncoder
+from PyPDF2 import PdfReader, PdfWriter
+
+# 01.1. Path
+BASE = Path(r"C:\path\to\your\project")
+PDF_DIR = BASE / "CCAP_Action_Plan"  # Folder for original planning documents (PDF)
+OUT_DIR = BASE / "Output"            # Folder for saving results
+CHROMA_DIR = BASE / "ChromaDB"       # Folder for Chroma used for RAG pipeline
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 01.2. API key
+UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY", "*****************") # Upstage API Key
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "*******************") # OpenAI API Key
+LLM_MODEL = "gpt-5-mini-2025-08-07"
+
+# 01.3. Embedding model and reranker
+EMB_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
+
+emb = HuggingFaceEmbeddings(
+    model_name=EMB_MODEL,
+    encode_kwargs={
+        "normalize_embeddings": True,
+        "prompt_name": "query",
+    },
+)
+
+db = Chroma(
+    persist_directory=str(CHROMA_DIR),
+    embedding_function=emb,
+)
+
+reranker = CrossEncoder(
+    RERANK_MODEL,
+    max_length=32768,
+)
+
+# 02. Passer API Call (Upstage Document Parse)
+def parse_with_upstage(pdf_path: Path) -> str:
+    url = "https://api.upstage.ai/v1/document-digitization"
+    headers = {"Authorization": f"Bearer {UPSTAGE_API_KEY}"}
+
+    payload = {
+        "model": "document-parse-260930",
+        "ocr": "force",
+        "output_formats": "['html']",
+        "merge_multipage_tables": "true",
+        "chart_recognition": "true",
+    }
+
+    with pdf_path.open("rb") as f:
+        res = requests.post(
+            url,
+            headers=headers,
+            files={"document": f},
+            data=payload,
+            timeout=(30, 300),
+        )
+
+    res.raise_for_status()
+
+    html = res.json().get("content", {}).get("html")
+
+    if not isinstance(html, str) or not html.strip():
+        raise ValueError(
+            "Upstage returned empty or invalid HTML."
+        )
+
+    out_path = OUT_DIR / f"{pdf_path.stem}_parsed.html"
+    out_path.write_text(html, encoding="utf-8")
+
+    return html
+
+# 03. PDF Parsing + HTML Merging
+def list_pdfs(max_n: int = 10):  # Return list of PDF files in the PDF directory.
+    pdf_files = sorted(PDF_DIR.glob("*.pdf"))
+    if not pdf_files:
+        raise FileNotFoundError(f"No PDF files: {PDF_DIR}")
+    for i, p in enumerate(pdf_files[:max_n], start=1):
+        print(f"{i:>3}. {p.name}")
+    return pdf_files
+
+def pick_pdf_by_fragment(fragment: str) -> Path:  # Select a PDF file by matching part of its filename.
+    frag = fragment.lower()
+    matches = [p for p in PDF_DIR.glob("*.pdf") if frag in p.name.lower()]
+    if not matches:
+        raise FileNotFoundError(f"No PDF matching fragment: '{fragment}'")
+    matches.sort(key=lambda p: len(p.name)) 
+    target = matches[0]
+    return target
+
+def extract_section_by_fixed_keywords(pdf_path: Path, min_page_threshold: int = 10, max_section_pages: int = 90) -> list[Path]:  # Extract a section of a PDF bounded by fixed Korean keywords, then split into chunks if the section exceeds max_section_pages.
+    reader = PdfReader(pdf_path)
+    start_page, end_page = None, None
+
+    start_kw = "부문별세부시행계획"  # Starting keyword; enter the wording exactly as written in the document (E.g., 부문별세부시행계획)
+    end_kw = "계획의집행및관리"      # Ending keyword; enter the wording exactly as written in the document (E.g., 계획의집행및관리)
+
+    # 03.1. Locate start and end pages
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        text_clean = re.sub(r"\s+", "", text)
+
+        if start_page is None and i >= min_page_threshold and start_kw in text_clean:
+            start_page = i
+        elif start_page is not None and end_kw in text_clean:
+            end_page = i
+            break
+
+    if start_page is None:
+        raise ValueError(f"Start keyword '{start_kw}' not found after page {min_page_threshold + 1}.")
+    if end_page is None:
+        end_page = len(reader.pages)
+
+    total_pages = end_page - start_page
+
+    # 03.2. Split extracted section if required
+    section_parts = []
+    for idx in range(0, total_pages, max_section_pages):
+        writer = PdfWriter()
+        part_start = start_page + idx
+        part_end = min(start_page + idx + max_section_pages, end_page)
+        
+        for j in range(part_start, part_end):
+            writer.add_page(reader.pages[j])
+
+        part_path = OUT_DIR / f"{pdf_path.stem}_section_part{len(section_parts)+1}.pdf"
+        with open(part_path, "wb") as f:
+            writer.write(f)
+
+        section_parts.append(part_path)
+
+    return section_parts
+
+# 03.3. Pipeline execution
+files = list_pdfs()
+target_pdf = pick_pdf_by_fragment("file_name")  # Select the plan, matching its name.
+section_parts = extract_section_by_fixed_keywords(target_pdf, min_page_threshold=150, max_section_pages=90)  # 'min_page_threshold=150': start keyword search begins after page 150 / 'max_section_pages=90': split extracted section into chunks of up to 90 pages
+
+merged_html = ""  
+for i, section_pdf in enumerate(section_parts, start=1):
+    html_chunk = parse_with_upstage(section_pdf)
+    merged_html += f"\n<!-- SECTION {i} START -->\n" + html_chunk + f"\n<!-- SECTION {i} END -->\n"
+
+merged_path = OUT_DIR / f"{target_pdf.stem}_section_merged.html"
+merged_path.write_text(merged_html, encoding="utf-8")
+
+# 04. Information Extraction Stage
+# ---------------------------------------------------------
+def ask_llm_on_document(html_path: Path, model: str = LLM_MODEL) -> str:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    document_text = html_path.read_text(encoding="utf-8")
+
+    # 04.1. Prompt
+    user_prompt = f"""
+        # Extract the text exactly as written in the document. Do not paraphrase, rewrite, or modify wording.
+        # Do not infer, assume, or supplement any information that is not explicitly stated in the document.
+        # Exclude all labels, numbering, bracketed codes, and formatting markers from outputs; return only the descriptive text.
+        
+        # Objective/Action classification rules:       
+        ## Only the sections in the document’s tables or main text that are explicitly marked as “추진전략” should be identified as {{objective}}.
+        ## Only the sections in the document’s tables or main text that are explicitly marked as “실천과제” should be identified as {{action}}.
+        ## Only structural labels (e.g., 추진전략, 실천과제) determine classification; Do not classify objectives and actions based on semantic meaning, wording style, and phrasing.
+        
+        # Maladaptation definition: 
+        ## Maladaptation arises from unintended trade-offs created by implementing an action to achieve its objective—such as harms imposed on other policy goals, social groups, or spatial areas.
+        ## Do not classify background problems, general negative conditions, or implementation challenges (e.g., costs, burdens, resource shortages) as maladaptation.
+        ## Do not infer maladaptation unless explicitly stated; if no maladaptation is explicitly mentioned for an action, output “(Missing)”.
+        
+        # Extract maladaptation risks only for each {{action}} in relation to its corresponding {{objective}}.
+        # Attach maladaptation output under each action, but treat maladaptation as occurring at the objective–action pair level.
+        
+        Output Format (must follow this structure strictly):
+        # Objective: {{objective}}
+        ## Action: {{action}}
+        ## Maladaptation risks: ...
+
+        Output Structure Rules:
+        # Output each objective–action pair as a separate block.
+        # Each block must contain exactly one Objective, one Action, and one Maladaptation risks field.
+        # If multiple actions correspond to the same objective, create a separate block for each action and repeat the identical objective text in every block.
+        # Do not list multiple actions under a single Objective heading.
+        # Repeat this block for all objective–action pairs.
+        
+        === DOCUMENT START ===
+        {document_text}
+        === DOCUMENT END ===
+    """
+
+    resp = client.responses.create(
+        model=model, reasoning={"effort":"medium"}, input=[{"role": "user", "content": user_prompt}],
+    )
+
+    final_text = resp.output_text.strip() if hasattr(resp, "output_text") else ""
+    clean_stem = html_path.stem.replace("_section_merged", "")
+    out_path = OUT_DIR / f"LLM_Extract_{clean_stem}.txt"
+    out_path.write_text(final_text, encoding="utf-8")    
+
+    return final_text
+
+html_path = OUT_DIR / f"{target_pdf.stem}_section_merged.html"
+ask_llm_on_document(html_path)
+
+# 05. Inference stage: Objective-action pair inference
+# ---------------------------------------------------------
+def format_author_year(metadata):
+    authors = metadata.get("author") or metadata.get("authors")
+    year = metadata.get("year")
+
+    if not authors or not year:
+        source = (
+            metadata.get("title")
+            or metadata.get("source")
+            or "Unknown source"
+        )
+        return f"{source} [author/year metadata incomplete]"
+
+    if isinstance(authors, (list, tuple)):
+        names = [str(name).strip() for name in authors if name]
+    else:
+        names = re.split(
+            r"\s*(?:;|,|\band\b|&)\s*",
+            str(authors).strip(),
+        )
+
+    names = [name for name in names if name]
+
+    if not names:
+        return f"Unknown author, {year}"
+
+    surnames = [name.split()[-1] for name in names]
+
+    if len(surnames) == 1:
+        author_text = surnames[0]
+    elif len(surnames) == 2:
+        author_text = f"{surnames[0]} and {surnames[1]}"
+    else:
+        author_text = f"{surnames[0]} et al."
+
+    return f"{author_text}, {year}"
+
+def infer_missing_impacts(extracted_txt_path: Path, model: str = LLM_MODEL, top_k: int = 5):
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    extracted_text = extracted_txt_path.read_text(encoding="utf-8")
+
+    # 05.1. Seperate objective and action sections
+    sections = re.split(r"(?=^# Objective:)", extracted_text, flags=re.MULTILINE)
+    sections = [s.strip() for s in sections if s.strip()]
+
+    total_results = []
+
+    for sidx, sec in enumerate(sections, start=1):
+
+        # 05.1.1. Objective
+        obj_match = re.search(r"^# Objective:\s*(.+)", sec, flags=re.MULTILINE)
+        if not obj_match:
+            continue
+        objective = obj_match.group(1).strip()
+
+        # 05.1.2. Action and maladaptation
+        pairs = re.findall(
+            r"## Action:\s*(.+?)\s*## Maladaptation risks:\s*(.+?)(?=^## Action:|$)",
+            sec,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+
+        if not pairs:
+            continue
+
+        # 05.1.3. Collect only missing actions
+        missing_actions = []
+        for action, risk in pairs:
+            action = action.strip()
+            risk = risk.strip()
+            if risk == "(Missing)":
+                missing_actions.append(action)
+
+        if not missing_actions:
+            continue
+
+        # 05.2. Inference for each missing action
+        for aidx, action in enumerate(missing_actions, start=1):
+
+            # 05.2.1. Query for retrieval (Objective–Action pair) 
+            query = f"Maladaptation from implementing '{objective}' via measure '{action}'."
+
+            # 05.2.2. Retrieval
+            docs = db.similarity_search(query, k=top_k)
+
+            # 05.2.3. Re-ranking
+            pairs_for_rerank = [
+                (query, d.page_content)
+                for d in docs
+            ]
+
+            rerank_scores = reranker.predict(
+                pairs_for_rerank
+            )
+
+            scored_docs = [
+                (
+                    float(score), retrieval_rank, d,
+                )
+                for retrieval_rank, (score, d) in enumerate(
+                    zip(rerank_scores, docs),
+                    start=1,
+                )
+            ]
+
+            scored_docs.sort(
+                key=lambda x: x[0], reverse=True,
+            )
+
+            # 05.2.4. Build evidence text
+            evidence_records = []
+
+            for rank, (score, retrieval_rank, d) in enumerate(
+                scored_docs, start=1
+            ):
+                metadata = dict(d.metadata or {})
+                citation = format_author_year(metadata)
+
+                evidence_records.append({
+                    "evidence_id": f"E{rank}", "retrieval_rank": retrieval_rank, "rerank_rank": rank,
+                    "rerank_score": score, "selected_for_llm": rank <= 3, "citation": citation, "metadata": metadata, "passage": d.page_content,
+                })
+
+            selected_records = [r for r in evidence_records if r["selected_for_llm"]]
+            evidence_by_id = {
+                r["evidence_id"]: r for r in selected_records
+            }
+
+            context_chunks = [
+                f"[{r['evidence_id']}]\n"
+                f"Citation: {r['citation']}\n"
+                f"Source metadata: "
+                f"{json.dumps(r['metadata'], ensure_ascii=False, default=str)}\n"
+                f"Passage:\n{r['passage']}"
+                for r in selected_records
+            ]
+            context_text = "\n\n".join(context_chunks) or "(No evidence)"
+
+            evidence_dir = OUT_DIR / f"Retrieval_{extracted_txt_path.stem}"
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+
+            evidence_path = evidence_dir / f"O{sidx:03d}_A{aidx:03d}.json"
+            retrieval_record = {
+                "objective": objective,
+                "action": action,
+                "query": query,
+                "evidence": evidence_records,
+                "context_sent_to_llm": context_text,
+            }
+            evidence_path.write_text(
+                json.dumps(
+                    retrieval_record, ensure_ascii=False, indent=2, default=str,                   
+                ),
+                encoding="utf-8",
+            )
+            
+            # 05.2.5. Prompt
+            prompt = f"""
+                     # Your task is to infer maladaptation risks that may arise when achieving the given {objective} through its {action}.
+
+                     # Maladaptation definition: 
+                     ## Maladaptation arises from unintended trade-offs created by implementing an action to achieve its objective—such as harms imposed on other policy goals, social groups, or spatial areas.
+                     ## Do not classify background problems, general negative conditions, or implementation challenges (e.g., costs, burdens, resource shortages) as maladaptation.
+                 
+                     # Using only the contextual evidence provided below, infer maladaptation risks for each objective–action pair.
+                     # If no evidence supports a maladaptation risk, write: "(No evidence-based maladaptation found)"
+                 
+                     ---
+                     Objective: {objective}
+                    
+                     Action: {action}
+
+                     Contextual Evidence: {context_text}
+                     ---
+                 
+                     # Instructions:
+                     ## 1. Write ONE concise paragraph describing an evidence-supported maladaptation.
+                     ## 2. Cite supporting evidence using its exact ID in square brackets, e.g., [E1] or [E1] [E2].
+                     ## 3. Only cite evidence IDs provided in Contextual Evidence.
+                     ## 4. Do not write author-year citations yourself; these will be added programmatically.                     
+                     ## 5. If no evidence supports a maladaptation risk, output only: "(No evidence-based maladaptation found)"
+                     ## 6. Respond in English.
+                        
+                     Output format (must follow this structure strictly):
+                     # Inferred risk for: {objective} – {action}
+                     [Paragraph OR (No evidence-based maladaptation found)]
+                     """
+
+            # 05.2.6. Invoke LLM
+            resp = client.responses.create(
+                model=model, reasoning={"effort":"medium"}, input=[{"role": "user", "content": prompt}],
+            )          
+
+            raw_inference = (getattr(resp, "output_text", "") or "").strip()
+
+            cited_ids = list(dict.fromkeys(
+                re.findall(r"\[(E\d+)\]", raw_inference)
+            ))
+            invalid_ids = [eid for eid in cited_ids if eid not in evidence_by_id]
+
+            response_body = re.sub(
+                r"^\s*# Inferred risk for:[^\n]*(?:\n|$)",
+                "",
+                raw_inference,
+                flags=re.MULTILINE,
+            ).strip()
+
+            no_evidence = (response_body == "(No evidence-based maladaptation found)")
+
+            if not raw_inference:
+                citation_check = "EMPTY_RESPONSE"
+            elif invalid_ids:
+                citation_check = f"INVALID_EVIDENCE_IDS: {invalid_ids}"
+            elif not cited_ids and not no_evidence:
+                citation_check = "MISSING_EVIDENCE_IDS"
+            else:
+                citation_check = "PASS"
+      
+            citations = list(dict.fromkeys(
+                evidence_by_id[eid]["citation"]
+                for eid in cited_ids
+                if eid in evidence_by_id
+            ))
+
+            body = re.sub(
+                r"^\s*# Inferred risk for:[^\n]*(?:\n|$)",
+                "",
+                raw_inference,
+                flags=re.MULTILINE,
+            ).strip()
+
+            body = re.sub(
+                r"\[(E\d+)\]",
+                lambda m: "" if m.group(1) in evidence_by_id else m.group(0),
+                body,
+            )
+
+            body = " ".join(body.split())
+            body = re.sub(r"\s+([.,;:!?])", r"\1", body)
+
+            if citations:
+                body = body.rstrip()
+                if body.endswith("."):
+                    body = body[:-1].rstrip()
+
+                body += f" (Evidence: {'; '.join(citations)})."
+
+            heading = f"# Inferred risk for: {objective} – {action}"
+            inference = f"{heading}\n{body}"
+
+            if citation_check != "PASS":
+                inference += f"\n[Citation check: {citation_check}]"
+
+            retrieval_record.update({
+                "raw_inference": raw_inference,
+                "inference_with_citations": inference,
+                "cited_evidence_ids": cited_ids,
+                "citation_check": citation_check,
+            })
+            evidence_path.write_text(
+                json.dumps(
+                    retrieval_record,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+
+            total_results.append(inference + "\n")
+
+    # 05.3. Save inference results
+    if not total_results:
+        return None
+
+    final_output = "\n\n".join(total_results)
+
+    clean_stem = extracted_txt_path.stem.replace("_SINGLE", "").replace("_section_merged", "").replace("LLM_Extract_", "")
+    out_path = OUT_DIR / f"LLM_Inferred_{clean_stem}.txt"
+    out_path.write_text(final_output, encoding="utf-8")
+
+    return final_output
+
+# 05.4. Run inference
+extracted_txt_path = OUT_DIR / f"LLM_Extract_{html_path.stem.replace('_section_merged','')}.txt"
+infer_missing_impacts(extracted_txt_path)
